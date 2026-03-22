@@ -10,6 +10,7 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = {"source_path", "target_filename", "status"}
+UNDO_COLUMNS = ["new_path", "original_path"]
 
 
 def configure_logging() -> None:
@@ -27,6 +28,11 @@ def parse_args() -> argparse.Namespace:
         "--plan_csv",
         default="output/rename_plan.csv",
         help="Path to the rename plan CSV.",
+    )
+    parser.add_argument(
+        "--undo_csv",
+        default="output/undo_rename_plan.csv",
+        help="Path to write the undo rename plan when applying renames.",
     )
     parser.add_argument(
         "--apply",
@@ -54,9 +60,9 @@ def resolve_target_path(source_path: Path, target_filename: str) -> Path:
     return source_path.with_name(target_filename)
 
 
-def resolve_collision(target_path: Path) -> Path:
+def resolve_collision(target_path: Path) -> tuple[Path, int]:
     if not target_path.exists():
-        return target_path
+        return target_path, 0
 
     stem = target_path.stem
     suffix = target_path.suffix
@@ -64,7 +70,7 @@ def resolve_collision(target_path: Path) -> Path:
     while True:
         candidate = target_path.with_name(f"{stem}_dup{counter}{suffix}")
         if not candidate.exists():
-            return candidate
+            return candidate, counter
         counter += 1
 
 
@@ -78,10 +84,23 @@ def should_skip_row(source_path_raw: str, target_filename: str, status: str) -> 
     return None
 
 
-def process_plan(plan_df: pd.DataFrame, apply_changes: bool) -> tuple[int, int, int]:
-    total_files = len(plan_df)
-    renamed_files = 0
-    skipped_files = 0
+def write_undo_plan(undo_rows: list[dict[str, str]], undo_csv: Path) -> None:
+    undo_csv.parent.mkdir(parents=True, exist_ok=True)
+    undo_df = pd.DataFrame(undo_rows, columns=UNDO_COLUMNS)
+    undo_df.to_csv(undo_csv, index=False)
+    LOGGER.info("Wrote %s undo rows to %s", len(undo_df), undo_csv)
+
+
+def process_plan(
+    plan_df: pd.DataFrame,
+    apply_changes: bool,
+    undo_csv: Path,
+) -> tuple[int, int, int, int]:
+    total_rows = len(plan_df)
+    successful_renames = 0
+    skipped_rows = 0
+    collisions_handled = 0
+    undo_rows: list[dict[str, str]] = []
 
     for row in plan_df.itertuples(index=False):
         source_path_raw = str(row.source_path)
@@ -90,35 +109,52 @@ def process_plan(plan_df: pd.DataFrame, apply_changes: bool) -> tuple[int, int, 
 
         skip_reason = should_skip_row(source_path_raw, target_filename, status)
         if skip_reason:
-            skipped_files += 1
+            skipped_rows += 1
             LOGGER.info("Skipping row: %s", skip_reason)
             continue
 
         source_path = Path(source_path_raw)
         if not source_path.exists():
-            skipped_files += 1
+            skipped_rows += 1
             LOGGER.warning("Skipping missing source file: %s", source_path)
             continue
 
         desired_target = resolve_target_path(source_path, target_filename)
-        final_target = resolve_collision(desired_target)
+        final_target, collision_index = resolve_collision(desired_target)
+        if collision_index:
+            collisions_handled += 1
+            LOGGER.warning(
+                "Target exists for %s; using collision-safe name %s",
+                source_path.name,
+                final_target.name,
+            )
 
         if source_path.resolve() == final_target.resolve():
-            skipped_files += 1
+            skipped_rows += 1
             LOGGER.info("Skipping unchanged file: %s", source_path)
             continue
 
+        print(f"{source_path} -> {final_target}")
+
         if not apply_changes:
-            print(f"{source_path} -> {final_target}")
-            renamed_files += 1
+            successful_renames += 1
             continue
 
         final_target.parent.mkdir(parents=True, exist_ok=True)
         source_path.rename(final_target)
+        undo_rows.append(
+            {
+                "new_path": str(final_target),
+                "original_path": str(source_path),
+            }
+        )
         LOGGER.info("Renamed %s -> %s", source_path, final_target)
-        renamed_files += 1
+        successful_renames += 1
 
-    return total_files, renamed_files, skipped_files
+    if apply_changes:
+        write_undo_plan(undo_rows, undo_csv)
+
+    return total_rows, successful_renames, skipped_rows, collisions_handled
 
 
 def main() -> int:
@@ -126,16 +162,24 @@ def main() -> int:
     args = parse_args()
 
     plan_csv = Path(args.plan_csv).expanduser()
+    undo_csv = Path(args.undo_csv).expanduser()
     plan_df = load_plan(plan_csv)
+
     if args.apply:
-        LOGGER.info("Apply mode enabled; files will be renamed.")
+        LOGGER.info("Apply mode enabled; files will be renamed and an undo plan will be written.")
     else:
         LOGGER.info("Dry-run mode enabled; no files will be modified.")
-    total_files, renamed_files, skipped_files = process_plan(plan_df, args.apply)
 
-    LOGGER.info("Summary: total files = %s", total_files)
-    LOGGER.info("Summary: renamed files = %s", renamed_files)
-    LOGGER.info("Summary: skipped files = %s", skipped_files)
+    total_rows, successful_renames, skipped_rows, collisions_handled = process_plan(
+        plan_df,
+        args.apply,
+        undo_csv,
+    )
+
+    LOGGER.info("Summary: total rows = %s", total_rows)
+    LOGGER.info("Summary: successful renames = %s", successful_renames)
+    LOGGER.info("Summary: skipped rows = %s", skipped_rows)
+    LOGGER.info("Summary: collisions handled = %s", collisions_handled)
     return 0
 
 
