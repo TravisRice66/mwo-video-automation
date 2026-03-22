@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+raw_videos/
+output/
+
+data/matches_review.csv
+data/manual_overrides.csv
+data/lobby_export.csv
+
+.DS_Store
+Thumbs.db
