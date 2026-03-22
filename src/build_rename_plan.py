@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -29,10 +32,13 @@ REQUIRED_MATCH_COLUMNS = {
     "map",
 }
 VIDEO_REVIEW_COLUMNS = [
+    "row_type",
     "obs_file",
     "full_path",
     "obs_datetime",
     "datetime_source",
+    "duration_seconds",
+    "candidate_status",
     "match_id",
     "game_time",
     "mech",
@@ -86,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         default="output/rename_plan.csv",
         help="Path for the rename plan CSV output.",
     )
+    parser.add_argument(
+        "--min_duration",
+        type=float,
+        default=120.0,
+        help="Minimum duration in seconds for a video to be considered a match candidate.",
+    )
     return parser.parse_args()
 
 
@@ -103,19 +115,105 @@ def parse_datetime_from_filename(video_path: Path) -> datetime | None:
         return None
 
 
-def scan_videos(video_dir: Path) -> pd.DataFrame:
+def resolve_ffprobe_path() -> str | None:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path:
+        return ffprobe_path
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    fallback_paths = [
+        Path(local_appdata) / "Microsoft" / "WinGet" / "Links" / "ffprobe.exe",
+        Path(local_appdata) / "Microsoft" / "WindowsApps" / "ffprobe.exe",
+    ]
+    for fallback_path in fallback_paths:
+        try:
+            if fallback_path.exists():
+                return str(fallback_path)
+            if fallback_path.is_symlink():
+                resolved_path = fallback_path.resolve(strict=False)
+                if resolved_path.exists():
+                    return str(resolved_path)
+        except OSError:
+            continue
+
+    winget_packages_root = Path(local_appdata) / "Microsoft" / "WinGet" / "Packages"
+    if winget_packages_root.exists():
+        package_matches = sorted(winget_packages_root.glob("Gyan.FFmpeg_*"))
+        for package_dir in package_matches:
+            for ffprobe_candidate in package_dir.glob("**/bin/ffprobe.exe"):
+                if ffprobe_candidate.exists():
+                    return str(ffprobe_candidate)
+
+    return None
+
+
+def probe_duration_seconds(ffprobe_path: str, video_path: Path) -> float | None:
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        LOGGER.warning("ffprobe failed for %s: %s", video_path.name, result.stderr.strip())
+        return None
+
+    output = result.stdout.strip()
+    if not output:
+        return None
+
+    try:
+        return round(float(output), 3)
+    except ValueError:
+        LOGGER.warning("Could not parse ffprobe duration for %s: %s", video_path.name, output)
+        return None
+
+
+def determine_candidate_status(obs_datetime: datetime | None, duration_seconds: float | None, min_duration: float) -> str:
+    if obs_datetime is None:
+        return "excluded_no_datetime"
+    if duration_seconds is not None and duration_seconds < min_duration:
+        return "excluded_short_clip"
+    return "candidate"
+
+
+def scan_videos(video_dir: Path, min_duration: float) -> pd.DataFrame:
     if not video_dir.exists():
         raise FileNotFoundError(f"Video directory does not exist: {video_dir}")
     if not video_dir.is_dir():
         raise NotADirectoryError(f"Video directory is not a directory: {video_dir}")
+
+    ffprobe_path = resolve_ffprobe_path()
+    if ffprobe_path:
+        LOGGER.info("Using ffprobe for duration checks: %s", ffprobe_path)
+    else:
+        LOGGER.warning("ffprobe is unavailable; duration_seconds will be blank and short clips cannot be excluded automatically.")
 
     records: list[dict[str, object]] = []
     for video_path in sorted(video_dir.rglob("*.mkv")):
         obs_datetime = parse_datetime_from_filename(video_path)
         datetime_source = "filename"
         if obs_datetime is None:
-            obs_datetime = datetime.fromtimestamp(video_path.stat().st_mtime)
-            datetime_source = "metadata"
+            try:
+                obs_datetime = datetime.fromtimestamp(video_path.stat().st_mtime)
+                datetime_source = "metadata"
+            except OSError:
+                obs_datetime = None
+                datetime_source = ""
+
+        duration_seconds = probe_duration_seconds(ffprobe_path, video_path) if ffprobe_path else None
+        candidate_status = determine_candidate_status(obs_datetime, duration_seconds, min_duration)
 
         records.append(
             {
@@ -123,13 +221,25 @@ def scan_videos(video_dir: Path) -> pd.DataFrame:
                 "full_path": str(video_path.resolve()),
                 "obs_datetime": obs_datetime,
                 "datetime_source": datetime_source,
-                "obs_date": obs_datetime.date().isoformat(),
+                "duration_seconds": duration_seconds,
+                "candidate_status": candidate_status,
+                "obs_date": "" if obs_datetime is None else obs_datetime.date().isoformat(),
             }
         )
 
     dataframe = pd.DataFrame(records)
     if dataframe.empty:
-        return pd.DataFrame(columns=["obs_file", "full_path", "obs_datetime", "datetime_source", "obs_date"])
+        return pd.DataFrame(
+            columns=[
+                "obs_file",
+                "full_path",
+                "obs_datetime",
+                "datetime_source",
+                "duration_seconds",
+                "candidate_status",
+                "obs_date",
+            ]
+        )
 
     dataframe = dataframe.sort_values(["obs_datetime", "full_path"]).reset_index(drop=True)
     LOGGER.info("Scanned %s .mkv videos from %s", len(dataframe), video_dir)
@@ -233,6 +343,7 @@ def determine_confidence(
 
 
 def build_review_row(
+    row_type: str,
     video_row: pd.Series | None,
     match_row: pd.Series | None,
     confidence: str,
@@ -240,10 +351,17 @@ def build_review_row(
     notes: str,
 ) -> dict[str, object]:
     return {
+        "row_type": row_type,
         "obs_file": "" if video_row is None else video_row["obs_file"],
         "full_path": "" if video_row is None else video_row["full_path"],
-        "obs_datetime": "" if video_row is None else video_row["obs_datetime"].strftime("%Y-%m-%d %H:%M:%S"),
+        "obs_datetime": (
+            ""
+            if video_row is None or pd.isna(video_row["obs_datetime"])
+            else video_row["obs_datetime"].strftime("%Y-%m-%d %H:%M:%S")
+        ),
         "datetime_source": "" if video_row is None else video_row["datetime_source"],
+        "duration_seconds": "" if video_row is None or pd.isna(video_row["duration_seconds"]) else video_row["duration_seconds"],
+        "candidate_status": "" if video_row is None else video_row["candidate_status"],
         "match_id": "" if match_row is None else str(match_row["match_id"]),
         "game_time": "" if match_row is None else match_row["game_time"].strftime("%Y-%m-%d %H:%M:%S"),
         "mech": "" if match_row is None else match_row["mech"],
@@ -283,7 +401,10 @@ def match_videos_to_matches(matches_df: pd.DataFrame, videos_df: pd.DataFrame) -
     review_rows: list[dict[str, object]] = []
     rename_rows: list[dict[str, object]] = []
 
-    candidate_videos = videos_df[videos_df["obs_date"].isin(set(ROUND_TO_COMP_DATE.values()))].copy()
+    candidate_videos = videos_df[
+        (videos_df["obs_date"].isin(set(ROUND_TO_COMP_DATE.values())))
+        & (videos_df["candidate_status"] == "candidate")
+    ].copy()
     LOGGER.info("Found %s candidate competition-date videos", len(candidate_videos))
 
     for comp_date, date_matches in matches_df.groupby("comp_date", sort=True):
@@ -319,7 +440,16 @@ def match_videos_to_matches(matches_df: pd.DataFrame, videos_df: pd.DataFrame) -
                 f"candidate_videos={len(date_videos)}; {confidence_note}"
             )
 
-            review_rows.append(build_review_row(video_row, match_row, confidence, match_status, notes))
+            review_rows.append(
+                build_review_row(
+                    "matched_comp_video",
+                    video_row,
+                    match_row,
+                    confidence,
+                    match_status,
+                    notes,
+                )
+            )
             rename_rows.append(
                 {
                     "source_path": video_row["full_path"],
@@ -343,7 +473,16 @@ def match_videos_to_matches(matches_df: pd.DataFrame, videos_df: pd.DataFrame) -
                     int(match_row["game"]),
                     comp_date,
                 )
-                review_rows.append(build_review_row(None, match_row, "low", "review_needed", notes))
+                review_rows.append(
+                    build_review_row(
+                        "matched_comp_video",
+                        None,
+                        match_row,
+                        "low",
+                        "review_needed",
+                        notes,
+                    )
+                )
                 rename_rows.append(
                     {
                         "source_path": "",
@@ -361,7 +500,36 @@ def match_videos_to_matches(matches_df: pd.DataFrame, videos_df: pd.DataFrame) -
         extra_videos = date_videos[~date_videos["full_path"].isin(used_paths)].copy()
         for _, extra_video in extra_videos.iterrows():
             notes = f"comp_date={comp_date}; left unmatched as extra same-day recording"
-            review_rows.append(build_review_row(extra_video, None, "", "extra_unmatched", notes))
+            review_rows.append(
+                build_review_row(
+                    "unmatched_extra",
+                    extra_video,
+                    None,
+                    "",
+                    "extra_unmatched",
+                    notes,
+                )
+            )
+
+    excluded_same_day_videos = videos_df[
+        (videos_df["obs_date"].isin(set(ROUND_TO_COMP_DATE.values())))
+        & (videos_df["candidate_status"] != "candidate")
+    ].copy()
+    for _, excluded_video in excluded_same_day_videos.sort_values(["obs_datetime", "full_path"]).iterrows():
+        notes = f"comp_date={excluded_video['obs_date']}; excluded from matching because candidate_status={excluded_video['candidate_status']}"
+        row_type = "excluded_short_clip"
+        if excluded_video["candidate_status"] != "excluded_short_clip":
+            row_type = "unmatched_extra"
+        review_rows.append(
+            build_review_row(
+                row_type,
+                excluded_video,
+                None,
+                "",
+                "excluded",
+                notes,
+            )
+        )
 
     review_df = pd.DataFrame(review_rows)
     if review_df.empty:
@@ -385,17 +553,39 @@ def write_csv(dataframe: pd.DataFrame, output_path: Path) -> None:
 
 
 def log_summary(videos_df: pd.DataFrame, review_df: pd.DataFrame, matches_df: pd.DataFrame) -> None:
-    candidate_video_count = int(videos_df["obs_date"].isin(set(ROUND_TO_COMP_DATE.values())).sum()) if not videos_df.empty else 0
+    candidate_video_count = int(
+        (
+            videos_df["obs_date"].isin(set(ROUND_TO_COMP_DATE.values()))
+            & (videos_df["candidate_status"] == "candidate")
+        ).sum()
+    ) if not videos_df.empty else 0
     auto_matches = int((review_df["match_status"] == "auto_matched").sum()) if not review_df.empty else 0
     review_needed = int((review_df["match_status"] == "review_needed").sum()) if not review_df.empty else 0
-    unmatched_extras = int((review_df["match_status"] == "extra_unmatched").sum()) if not review_df.empty else 0
+    matched_comp_video_rows = int((review_df["row_type"] == "matched_comp_video").sum()) if not review_df.empty else 0
+    unmatched_extra_rows = int((review_df["row_type"] == "unmatched_extra").sum()) if not review_df.empty else 0
+    excluded_short_clip_rows = int((review_df["row_type"] == "excluded_short_clip").sum()) if not review_df.empty else 0
+    review_row_count = len(review_df)
+    excluded_short_clips = int((videos_df["candidate_status"] == "excluded_short_clip").sum()) if not videos_df.empty else 0
 
     LOGGER.info("Summary: total videos scanned = %s", len(videos_df))
     LOGGER.info("Summary: comp matches found = %s", len(matches_df))
     LOGGER.info("Summary: candidate comp-date videos = %s", candidate_video_count)
     LOGGER.info("Summary: auto matches = %s", auto_matches)
     LOGGER.info("Summary: review needed = %s", review_needed)
-    LOGGER.info("Summary: unmatched extras = %s", unmatched_extras)
+    LOGGER.info("Summary: matched_comp_video rows = %s", matched_comp_video_rows)
+    LOGGER.info("Summary: unmatched_extra rows = %s", unmatched_extra_rows)
+    LOGGER.info("Summary: excluded_short_clip rows = %s", excluded_short_clip_rows)
+    LOGGER.info("Summary: excluded short clips = %s", excluded_short_clips)
+    LOGGER.info(
+        "Summary: review CSV rows = %s (= matched_comp_video %s + unmatched_extra %s + excluded_short_clip %s)",
+        review_row_count,
+        matched_comp_video_rows,
+        unmatched_extra_rows,
+        excluded_short_clip_rows,
+    )
+    LOGGER.info(
+        "Review CSV row count can exceed matched comp rows because it also includes unmatched extras and excluded rows for auditability."
+    )
 
 
 def main() -> int:
@@ -407,7 +597,7 @@ def main() -> int:
     review_output = Path(args.review_output).expanduser()
     rename_output = Path(args.rename_output).expanduser()
 
-    videos_df = scan_videos(video_dir)
+    videos_df = scan_videos(video_dir, args.min_duration)
     matches_df = load_comp_matches(matches_csv)
     review_df, rename_df = match_videos_to_matches(matches_df, videos_df)
 
