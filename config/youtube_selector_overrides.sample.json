@@ -1,0 +1,16 @@
+{
+  "title_input_selectors": [
+    "ytcp-social-suggestions-textbox#title-textarea #textbox",
+    "ytcp-social-suggestion-input#title-textarea #textbox",
+    "textarea[aria-label*='title']"
+  ],
+  "description_input_selectors": [
+    "ytcp-social-suggestions-textbox#description-textarea #textbox",
+    "ytcp-social-suggestion-input#description-textarea #textbox",
+    "textarea[aria-label*='description']"
+  ],
+  "save_button_selectors": [
+    "button:has-text('Save')",
+    "ytcp-button#save button"
+  ]
+}

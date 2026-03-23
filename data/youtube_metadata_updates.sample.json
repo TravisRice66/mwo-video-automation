@@ -1,0 +1,24 @@
+{
+  "videos": [
+    {
+      "video_id": "abc123XYZ89",
+      "new_title": "JVN-11F on Polar Highlands | Round 1 Game 1 | MWO Competitive",
+      "description": "MWO Competitive Match\n\nRound 1, Game 1\nMap: Polar Highlands\nMech: JVN-11F\n\nFull competitive gameplay from organized MWO matches.\n\n#MWO #MechWarrior #MWOComp",
+      "tags": [
+        "mwo",
+        "mechwarrior online",
+        "mwo competitive",
+        "jvn-11f"
+      ],
+      "playlist": "MWO Competitive Archive",
+      "audience": "not_made_for_kids",
+      "visibility": "unlisted"
+    },
+    {
+      "current_title": "BSK-6CS on Hibernal Rift | Round 1 Game 2 | MWO Competitive",
+      "description": "Only description updated for this row.",
+      "tags": "mwo, hibernal rift",
+      "audience": "not_made_for_kids"
+    }
+  ]
+}

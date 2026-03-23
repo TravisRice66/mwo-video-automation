@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.playwright/
+.env
+.env.*
 
 raw_videos/
 output/
@@ -9,6 +12,7 @@ output/
 data/matches_review.csv
 data/manual_overrides.csv
 data/lobby_export.csv
+data/video_matches_review.csv
 
 .DS_Store
 Thumbs.db
