@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +28,12 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+
+
+def normalize_upload_lookup_title(value: str) -> str:
+    text = Path(str(value).strip()).stem
+    text = re.sub(r"[^A-Za-z0-9]+", " ", text.lower())
+    return " ".join(text.split())
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,7 +70,7 @@ def main() -> int:
     if missing:
         raise ValueError(f"Input CSV is missing required columns: {missing}")
 
-    upload_lookup_titles = dataframe["filename"].map(lambda value: Path(str(value).strip()).stem)
+    upload_lookup_titles = dataframe["filename"].map(normalize_upload_lookup_title)
 
     template = pd.DataFrame(
         {

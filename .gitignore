@@ -16,3 +16,6 @@ data/video_matches_review.csv
 
 .DS_Store
 Thumbs.db
+config/youtube_oauth_token.json
+output/youtube_metadata_update_results_api.csv
+config/youtube_client_secret.json

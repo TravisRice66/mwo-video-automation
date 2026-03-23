@@ -56,16 +56,19 @@ PLAYLIST_DROPDOWN_SELECTORS = (
 PLAYLIST_DIALOG_SELECTORS = (
     "ytcp-playlist-dialog",
     "ytcp-dialog tp-yt-paper-dialog",
+    "tp-yt-paper-dialog:has(input[placeholder*='Search for a playlist'])",
 )
 
 PLAYLIST_SEARCH_INPUT_SELECTORS = (
     "ytcp-playlist-dialog input",
+    "input[placeholder*='Search for a playlist']",
     "input[placeholder*='Search']",
 )
 
 PLAYLIST_DONE_BUTTON_SELECTORS = (
     "ytcp-playlist-dialog button:has-text('Done')",
     "ytcp-playlist-dialog button:has-text('Save')",
+    "tp-yt-paper-dialog button:has-text('Done')",
     "button:has-text('Done')",
 )
 

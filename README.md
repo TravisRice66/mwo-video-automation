@@ -1,4 +1,4 @@
-# mwo-video-automation
+﻿# mwo-video-automation
 
 Practical scripts for MWO video workflows, including a working MVP for bulk metadata updates on already-uploaded YouTube videos.
 
@@ -16,7 +16,10 @@ Why this approach:
 - YouTube Studio native bulk editing is limited and inconsistent across fields (especially tags, audience, playlist combinations).
 - A per-video loop via UI is slower than a true API bulk endpoint, but in practice it is robust and works **now** for already uploaded videos.
 
-## New scripts added
+- [src/update_youtube_metadata_api.py](src/update_youtube_metadata_api.py:1)
+  - Uses the YouTube Data API with OAuth instead of Studio UI automation.
+  - Updates title, description, tags, playlist membership, audience, visibility, scheduled publish time, category, and optional thumbnail.
+  - Uses the same CSV/JSON row format and results CSV pattern as the Studio updater for smaller, cleaner automation runs when the API supports the field.
 
 - [`src/update_youtube_metadata.py`](src/update_youtube_metadata.py:1)
   - Reads CSV or JSON.
@@ -178,3 +181,34 @@ If OpenAI recovery is enabled, results also include `ai_guidance`.
   1. run with `--checkpoint_every`
   2. if interrupted, restart with `--resume_from_results <previous_results_csv>`
 - For unknown failures, enable `--capture_failure_artifacts` and optionally `--trace_on_failure` for deep diagnosis.
+
+## API-based updater option
+
+If you prefer the official YouTube Data API over Studio UI automation, use [`src/update_youtube_metadata_api.py`](src/update_youtube_metadata_api.py:1).
+
+Important notes:
+- This path uses OAuth client credentials, not an API key.
+- It works best when each row includes `video_id`.
+- Playlist behavior is additive: it ensures the video is in the requested playlist.
+- Some fields only work if the current video already has the required metadata Google expects in the update payload; the script preserves existing `categoryId` when present.
+
+### One-time setup for the API updater
+
+1. In Google Cloud, enable `YouTube Data API v3`.
+2. Create an OAuth Client ID of type `Desktop app`.
+3. Save the downloaded JSON as `config/youtube_client_secret.json`.
+4. Install dependencies from [`requirements.txt`](requirements.txt).
+
+### First API dry run
+
+```bat
+python src/update_youtube_metadata_api.py --input output/youtube_metadata_updates.csv --defaults_json config/youtube_metadata_defaults.sample.json --dry_run
+```
+
+The first run opens a browser for Google sign-in and writes a reusable token to `config/youtube_oauth_token.json`.
+
+### Real API run
+
+```bat
+python src/update_youtube_metadata_api.py --input output/youtube_metadata_updates.csv --defaults_json config/youtube_metadata_defaults.sample.json --results_csv output/youtube_metadata_update_results_api.csv
+```

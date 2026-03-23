@@ -408,6 +408,19 @@ def to_clean_string(value: Any) -> str:
     return str(value).strip()
 
 
+def normalize_lookup_text(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", " ", to_clean_string(value).lower())
+    return " ".join(normalized.split())
+
+
+def build_lookup_variants(value: str) -> list[str]:
+    variants: list[str] = []
+    for candidate in [to_clean_string(value), normalize_lookup_text(value)]:
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 def first_non_blank(record: dict[str, Any], keys: list[str]) -> Any:
     for key in keys:
         if key in record and not is_blank(record[key]):
@@ -608,10 +621,38 @@ def find_first_visible(scope: Page | Locator, selectors: tuple[str, ...], timeou
 
 
 def set_textbox_value(page: Page, locator: Locator, value: str) -> None:
-    locator.click()
-    page.keyboard.press("Control+A")
-    page.keyboard.press("Backspace")
-    page.keyboard.type(value, delay=4)
+    wait_for_editor_settle(page, milliseconds=1100)
+    locator.scroll_into_view_if_needed()
+    wait_for_editor_settle(page, milliseconds=500)
+    try:
+        locator.click(timeout=2500)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        page.keyboard.type(value, delay=4)
+        wait_for_editor_settle(page, milliseconds=500)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback for Studio editors where video overlays intercept pointer events.
+    locator.evaluate(
+        """
+        (el, textValue) => {
+          el.scrollIntoView({block: 'center', inline: 'nearest'});
+          el.focus();
+          if ('value' in el) {
+            el.value = textValue;
+          } else {
+            el.textContent = textValue;
+          }
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, data: textValue, inputType: 'insertText' }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: true }));
+        }
+        """,
+        value,
+    )
+    wait_for_editor_settle(page, milliseconds=700)
 
 
 def wait_for_manual_login(page: Page, timeout_seconds: int) -> None:
@@ -644,6 +685,7 @@ def open_video_editor(page: Page, job: VideoJob, action_timeout_ms: int, login_t
         page.goto(f"https://studio.youtube.com/video/{job.video_id}/edit", wait_until="domcontentloaded", timeout=60000)
         wait_for_manual_login(page, timeout_seconds=login_timeout_seconds)
         page.wait_for_url(re.compile(r"https://studio\.youtube\.com/video/.+/edit"), timeout=action_timeout_ms * 2)
+        wait_for_editor_settle(page, milliseconds=1800)
         return job.video_id
 
     if not job.lookup_text:
@@ -655,30 +697,37 @@ def open_video_editor(page: Page, job: VideoJob, action_timeout_ms: int, login_t
     if search_input is None:
         raise RuntimeError("Could not find YouTube Studio search input in Content page.")
 
-    search_input.click()
-    search_input.fill("")
-    search_input.type(job.lookup_text, delay=3)
-    search_input.press("Enter")
-    page.wait_for_timeout(1200)
+    lookup_variants = build_lookup_variants(job.lookup_text)
+    for lookup_variant in lookup_variants:
+        search_input.click()
+        search_input.fill("")
+        search_input.type(lookup_variant, delay=3)
+        search_input.press("Enter")
+        page.wait_for_timeout(1200)
 
-    video_row = page.locator("ytcp-video-row", has_text=job.lookup_text).first
-    try:
-        video_row.wait_for(state="visible", timeout=action_timeout_ms)
-    except PlaywrightTimeoutError:
-        video_link = None
-        for selector in VIDEO_ROW_TITLE_LINK_SELECTORS:
-            candidate = page.locator(selector, has_text=job.lookup_text).first
-            if candidate.count() > 0:
-                video_link = candidate
+        video_row = page.locator("ytcp-video-row", has_text=lookup_variant).first
+        try:
+            video_row.wait_for(state="visible", timeout=action_timeout_ms)
+        except PlaywrightTimeoutError:
+            video_link = None
+            for selector in VIDEO_ROW_TITLE_LINK_SELECTORS:
+                candidate = page.locator(selector, has_text=lookup_variant).first
+                if candidate.count() > 0:
+                    video_link = candidate
+                    break
+            if video_link is not None:
+                video_link.click()
                 break
-        if video_link is None:
-            raise RuntimeError(f"No video row matched lookup text: {job.lookup_text}")
-        video_link.click()
+        else:
+            row_link = video_row.locator("a[href*='/video/']").first
+            if row_link.count() == 0:
+                row_link = video_row.locator("a").first
+            row_link.click()
+            break
     else:
-        row_link = video_row.locator("a[href*='/video/']").first
-        if row_link.count() == 0:
-            row_link = video_row.locator("a").first
-        row_link.click()
+        raise RuntimeError(
+            f"No video row matched lookup text. Tried variants: {', '.join(lookup_variants)}"
+        )
 
     page.wait_for_url(re.compile(r"https://studio\.youtube\.com/video/.+/edit"), timeout=action_timeout_ms * 2)
 
@@ -689,8 +738,16 @@ def open_video_editor(page: Page, job: VideoJob, action_timeout_ms: int, login_t
 def ensure_show_more(page: Page, action_timeout_ms: int) -> None:
     show_more = find_first_visible(page, SHOW_MORE_BUTTON_SELECTORS, timeout_ms=1500)
     if show_more is not None:
-        show_more.click()
+        try:
+            show_more.click(timeout=min(action_timeout_ms, 3000))
+        except Exception:  # noqa: BLE001
+            # Some draft editors render the video overlay above the button; DOM click still works.
+            show_more.evaluate("(el) => el.click()")
         page.wait_for_timeout(min(800, action_timeout_ms // 10))
+
+
+def wait_for_editor_settle(page: Page, milliseconds: int = 900) -> None:
+    page.wait_for_timeout(milliseconds)
 
 
 def remove_existing_tags_if_possible(page: Page) -> None:
@@ -749,15 +806,22 @@ def set_tags(page: Page, tags: list[str], action_timeout_ms: int, tags_mode: str
 
 def set_playlist(page: Page, playlist_name: str, action_timeout_ms: int, playlist_mode: str) -> None:
     ensure_show_more(page, action_timeout_ms=action_timeout_ms)
+    wait_for_editor_settle(page, milliseconds=900)
 
     dropdown = find_first_visible(page, PLAYLIST_DROPDOWN_SELECTORS, timeout_ms=action_timeout_ms)
     if dropdown is None:
         raise RuntimeError("Could not find playlist dropdown in video editor.")
     dropdown.click()
+    wait_for_editor_settle(page, milliseconds=900)
 
     dialog = find_first_visible(page, PLAYLIST_DIALOG_SELECTORS, timeout_ms=action_timeout_ms)
     if dialog is None:
-        raise RuntimeError("Playlist dialog did not open.")
+        playlist_search_fallback = find_first_visible(page, PLAYLIST_SEARCH_INPUT_SELECTORS, timeout_ms=1500)
+        done_button_fallback = find_first_visible(page, PLAYLIST_DONE_BUTTON_SELECTORS, timeout_ms=1500)
+        if playlist_search_fallback is not None or done_button_fallback is not None:
+            dialog = page
+        else:
+            raise RuntimeError("Playlist dialog did not open.")
 
     if playlist_mode == "replace":
         for _ in range(50):
@@ -771,8 +835,11 @@ def set_playlist(page: Page, playlist_name: str, action_timeout_ms: int, playlis
     if playlist_search is not None:
         playlist_search.fill("")
         playlist_search.type(playlist_name, delay=2)
+        wait_for_editor_settle(page, milliseconds=700)
 
     option = dialog.locator("tp-yt-paper-checkbox", has_text=playlist_name).first
+    if option.count() == 0:
+        option = dialog.locator("tp-yt-paper-item", has_text=playlist_name).first
     if option.count() == 0:
         option = dialog.get_by_text(playlist_name, exact=False).first
     if option.count() == 0:
@@ -785,7 +852,7 @@ def set_playlist(page: Page, playlist_name: str, action_timeout_ms: int, playlis
     if done_button is None:
         raise RuntimeError("Could not find Done/Save button in playlist dialog.")
     done_button.click()
-    page.wait_for_timeout(250)
+    wait_for_editor_settle(page, milliseconds=1200)
 
 
 def set_audience(page: Page, audience: str, action_timeout_ms: int) -> None:
@@ -809,10 +876,14 @@ def set_audience(page: Page, audience: str, action_timeout_ms: int) -> None:
 
 
 def set_visibility(page: Page, visibility: str, action_timeout_ms: int) -> None:
-    dropdown = find_first_visible(page, VISIBILITY_DROPDOWN_SELECTORS, timeout_ms=1500)
-    if dropdown is None:
-        raise RuntimeError("Could not find visibility dropdown.")
-    dropdown.click()
+    # Draft editors do not always expose the normal visibility control. Skip here instead
+    # of failing after the other metadata has already been applied.
+    draft_markers = (
+        "text=This video is in a draft state",
+        "button:has-text('Edit draft')",
+    )
+    if find_first_visible(page, draft_markers, timeout_ms=1200) is not None:
+        return
 
     label_map = {
         VISIBILITY_PUBLIC: "Public",
@@ -820,13 +891,31 @@ def set_visibility(page: Page, visibility: str, action_timeout_ms: int) -> None:
         VISIBILITY_PRIVATE: "Private",
     }
     option_label = label_map[visibility]
+
+    # The current visibility is shown on the right-side summary panel even before opening the picker.
+    # If it already matches the desired value, skip this step instead of forcing a flaky reopen.
+    current_indicator_selectors = (
+        f"ytcp-video-metadata-visibility:has-text('{option_label}')",
+        f"ytcp-video-metadata-editor-basics:has-text('Visibility'):has-text('{option_label}')",
+        f"div:has-text('Visibility'):has-text('{option_label}')",
+    )
+    current_indicator = find_first_visible(page, current_indicator_selectors, timeout_ms=1200)
+    if current_indicator is not None:
+        return
+
+    wait_for_editor_settle(page, milliseconds=900)
+    dropdown = find_first_visible(page, VISIBILITY_DROPDOWN_SELECTORS, timeout_ms=1500)
+    if dropdown is None:
+        raise RuntimeError("Could not find visibility dropdown.")
+    dropdown.click()
+
     option = page.locator("tp-yt-paper-item", has_text=option_label).first
     if option.count() == 0:
         option = page.get_by_text(option_label, exact=True).first
     if option.count() == 0:
         raise RuntimeError(f"Visibility option not found: {option_label}")
     option.click()
-    page.wait_for_timeout(150)
+    wait_for_editor_settle(page, milliseconds=900)
 
 
 def set_thumbnail(page: Page, thumbnail_path: str, action_timeout_ms: int) -> None:
@@ -843,6 +932,7 @@ def set_thumbnail(page: Page, thumbnail_path: str, action_timeout_ms: int) -> No
 
 
 def click_save(page: Page, action_timeout_ms: int, dry_run: bool) -> str:
+    wait_for_editor_settle(page, milliseconds=900)
     save_button = find_first_visible(page, SAVE_BUTTON_SELECTORS, timeout_ms=action_timeout_ms)
     if save_button is None:
         raise RuntimeError("Could not find Save button in video editor.")
@@ -855,7 +945,7 @@ def click_save(page: Page, action_timeout_ms: int, dry_run: bool) -> str:
         return "no_changes_detected"
 
     save_button.click()
-    page.wait_for_timeout(1000)
+    wait_for_editor_settle(page, milliseconds=1400)
     return "saved"
 
 
